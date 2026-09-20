@@ -1,28 +1,38 @@
 package examples
 
 import (
+	"bufio"
+	"context"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/yatori-dev/yatori-go-core/api/mooc"
-	"github.com/yatori-dev/yatori-go-core/global"
-	"github.com/yatori-dev/yatori-go-core/utils"
 )
 
-// MOOC登录接口测试
-func TestPowGetP(t *testing.T) {
-	utils.YatoriCoreInit()
-	//测试账号
-	setup()
-	//构建用户结构体
-	cache := mooc.MOOCUserCache{
-		Account:   global.Config.Users[22].Account,
-		Password:  global.Config.Users[22].Password,
-		IpProxySW: false,
-		ProxyIP:   "",
+func TestMOOC(t *testing.T) {
+	if os.Getenv("YATORI_MOOC_INTEGRATION") != "1" {
+		t.Skip("requires authorized real account / trace")
 	}
-	cache.InitCookiesApi() //初始化Cookie
-	cache.GtApi()          //通过gt接口获取必要登录参数
-	cache.PowGetPApi()     //通过powGetP接口获取必要登录参数
-	cache.LoginApi()       //登录
-
+	account := os.Getenv("YATORI_MOOC_ACCOUNT")
+	if account == "" {
+		t.Skip("requires authorized real account / trace")
+	}
+	client, err := mooc.NewMOOCClient(account, mooc.ClientOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	ctx := context.Background()
+	if err := client.SendSMS(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Log("Enter the SMS code in the terminal.")
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil {
+		t.Fatal("unable to read SMS code")
+	}
+	if _, err := client.LoginSMS(ctx, strings.TrimSpace(line)); err != nil {
+		t.Fatal(err)
+	}
 }

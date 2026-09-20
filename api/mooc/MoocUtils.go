@@ -1,40 +1,40 @@
 package mooc
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"math/big"
 	"net/url"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/tjfoc/gmsm/sm4"
 	"github.com/tjfoc/gmsm/x509"
 )
 
-// 公钥
 var publicKey = "BC60B8B9E4FFEFFA219E5AD77F11F9E2"
 
-// RSA加密公钥
 var rsaPublic = "-----BEGIN PUBLIC KEY-----\nMIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQC5gsH+AA4XWONB5TDcUd+xCz7e\njOFHZKlcZDx+pF1i7Gsvi1vjyJoQhRtRSn950x498VUkx7rUxg1/ScBVfrRxQOZ8\nxFBye3pjAzfb22+RCuYApSVpJ3OO3KsEuKExftz9oFBv3ejxPlYc5yq7YiBO8XlT\nnQN0Sa4R4qhPO3I2MQIDAQAB\n-----END PUBLIC KEY-----"
 
-// 生成rtid
-func BuildRtId() string {
+func BuildRtId() (string, error) {
 	const charset = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 	result := make([]byte, 32)
-	for i := 0; i < 32; i++ {
-		n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+	for i := range result {
+		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(charset))))
+		if err != nil {
+			return "", &RequestError{Operation: "request identifier", Kind: ErrRequestFailed, cause: err}
+		}
 		result[i] = charset[n.Int64()]
 	}
-	return string(result)
+	return string(result), nil
 }
 
-// 解析 RSA 公钥
 func parseRSAPublicKey(pemStr string) (*rsa.PublicKey, error) {
 	block, _ := pem.Decode([]byte(pemStr))
 	if block == nil {
@@ -53,106 +53,64 @@ func parseRSAPublicKey(pemStr string) (*rsa.PublicKey, error) {
 	return pub, nil
 }
 
-// 构建PowGetP的Params参数
 func BuildPowGetPParams(pd, pkid, un, pvSid string, channel int, topURL, rtid string) string {
-	return `{"pd":"` + pd + `","pkid":"` + pkid + `","un":"` + un + `","pvSid":"` + pvSid + `","channel":"` + strconv.Itoa(channel) + `","topURL": "` + topURL + `","rtid":"` + rtid + `"}`
+	return marshalParams(map[string]any{"pd": pd, "pkid": pkid, "un": un, "pvSid": pvSid, "channel": strconv.Itoa(channel), "topURL": topURL, "rtid": rtid})
 }
 
-// 构建ZCInit的Params参数
 func BuildZCInitParams(pd, pkid, pkht string, channel int, topURL, rtid string) string {
-	return `{"channel":` + strconv.Itoa(channel) + `"pd":"` + pd + `","pkht":"` + pkht + `","pkid":"` + pkid + `","rtid":"` + rtid + `","topURL":"` + topURL + `"}`
+	return BuildDLInitParams(pd, pkid, pkht, channel, topURL, rtid)
 }
 
-// 构建DLInit的Params参数
 func BuildDLInitParams(pd, pkid, pkht string, channel int, topURL, rtid string) string {
-	return `{"pd":"` + pd + `","pkid":"` + pkid + `","pkht":"` + pkht + `","channel":` + strconv.Itoa(channel) + `,"topURL":"` + topURL + `","rtid":"` + rtid + `"}`
+	return marshalParams(map[string]any{"pd": pd, "pkid": pkid, "pkht": pkht, "channel": channel, "topURL": topURL, "rtid": rtid})
 }
 
-// 构建GT的Params参数
 func BuildGTParams(un string, channel int, pd, pkid string, topURL, rtid string) string {
-	return `{"un":"` + un + `","pd":"` + pd + `","pkid":"` + pkid + `","channel":` + strconv.Itoa(channel) + `,"topURL":"` + topURL + `","rtid":"` + rtid + `"}`
+	return marshalParams(map[string]any{"un": un, "pd": pd, "pkid": pkid, "channel": channel, "topURL": topURL, "rtid": rtid})
 }
 
 func BuildLParams(l, d int, un, pw, pd, pkid, tk, domains, puzzle string, spendTime, runTimes int, sid, x string, t, sign, channel int, topURL, rtid string) string {
-	return `{"l":` + strconv.Itoa(l) + `,"d":` + strconv.Itoa(d) + `,"un":"` + un + `","pw":"` + pw + `","pd":"` + pd + `","pkid":"` + pkid + `","tk":"` + tk + `","domains":"` + domains + `","pVParam":{"puzzle":"` + puzzle + `","spendTime":` + strconv.Itoa(spendTime) + `,"runTimes":` + strconv.Itoa(runTimes) + `,"sid":"` + sid + `","args": "{\"x\":\"` + x + `\",\"t\":` + strconv.Itoa(t) + `,\"sign\":` + strconv.Itoa(sign) + `}"},"channel":` + strconv.Itoa(channel) + `,"topURL":"` + topURL + `","rtid":"` + rtid + `"}`
+	args := marshalParams(map[string]any{"x": x, "t": t, "sign": sign})
+	return marshalParams(map[string]any{"l": l, "d": d, "un": un, "pw": pw, "pd": pd, "pkid": pkid, "tk": tk, "domains": domains,
+		"pVParam": map[string]any{"puzzle": puzzle, "spendTime": spendTime, "runTimes": runTimes, "sid": sid, "args": args},
+		"channel": channel, "topURL": topURL, "rtid": rtid})
 }
 
-// powgetp转登录数据
-func PowGetPTurnLData(puzzle, mod, x string, t int, minTime, maxTime int64) (int, int64, int, string) {
-	startTime := time.Now()
-	count := 0
-
-	// 解析大整数
-	bigx, ok := new(big.Int).SetString(x, 16)
-	if !ok {
-		panic("解析X失败")
-	}
-	bigmod, ok := new(big.Int).SetString(mod, 16)
-	if !ok {
-		panic("解析Mod失败")
-	}
-
-	for i := 0; i < t || time.Since(startTime).Milliseconds() < minTime; i++ {
-		// bigx = bigx * bigx % bigmod
-		bigx.Mul(bigx, bigx)
-		bigx.Mod(bigx, bigmod)
-
-		count++
-
-		if time.Since(startTime).Milliseconds() > maxTime {
-			break
-		}
-	}
-
-	timeSpent := time.Since(startTime).Milliseconds()
-
-	//signObj := map[string]any{
-	//	"runTimes":  count,
-	//	"spendTime": timeSpent,
-	//	"t":         count,
-	//	"x":         bigx.Text(16), // 转16进制字符串
-	//}
-	return count, timeSpent, count, bigx.Text(16)
+// All callers supply only strings, integers, and maps containing those types.
+func marshalParams(params map[string]any) string {
+	encoded, _ := json.Marshal(params)
+	return string(encoded)
 }
 
-// MOOC请求用的MS4国密算法加密
-func MOOCEncMS4(content string) string {
+func PowGetPTurnLData(puzzle, mod, x string, t int, minTime, maxTime int64) (int, int64, int, string, error) {
+	count, elapsed, iterations, result, _, err := VdfAsync(Data{Args: Args{Puzzle: puzzle, Mod: mod, X: x, T: t}, MinTime: minTime, MaxTime: maxTime})
+	return count, elapsed, iterations, result, err
+}
+
+func MOOCEncMS4(content string) (string, error) {
 	key, err := hex.DecodeString(publicKey)
+	if err != nil {
+		return "", &RequestError{Operation: "encrypt", Kind: ErrRequestFailed, cause: err}
+	}
 	out, err := sm4.Sm4Ecb(key, []byte(content), true)
 	if err != nil {
-		error.Error(err)
+		return "", &RequestError{Operation: "encrypt", Kind: ErrRequestFailed, cause: err}
 	}
-	fmt.Printf("cipher (hex): %x\n", out)
-	return fmt.Sprintf("%x", out)
+	return hex.EncodeToString(out), nil
 }
 
-// MOOC的RSA加密
-func MOOCRSA(content string) string {
-	// 解析公钥
-	block, _ := pem.Decode([]byte(rsaPublic))
-	if block == nil {
-		return ""
-	}
-	pub, err := x509.ParsePKIXPublicKey(block.Bytes)
+func MOOCRSA(content string) (string, error) {
+	pub, err := parseRSAPublicKey(rsaPublic)
 	if err != nil {
-		return ""
+		return "", &RequestError{Operation: "password encryption", Kind: ErrRequestFailed, cause: err}
 	}
-	rsaPub, ok := pub.(*rsa.PublicKey)
-	if !ok {
-		return ""
-	}
-
-	// 使用 PKCS1 v1.5 填充加密
-	cipherBytes, err := rsa.EncryptPKCS1v15(rand.Reader, rsaPub, []byte(content))
+	ciphertext, err := rsa.EncryptPKCS1v15(rand.Reader, pub, []byte(content))
 	if err != nil {
-		return ""
+		return "", &RequestError{Operation: "password encryption", Kind: ErrRequestFailed, cause: err}
 	}
-
-	// Base64 输出
-	return base64.StdEncoding.EncodeToString(cipherBytes)
+	return base64.StdEncoding.EncodeToString(ciphertext), nil
 }
 
-// MurmurHash3 32-bit 实现 (对应 powSign)
 func PowSign(key string, seed int) uint32 {
 	data := []byte(key)
 	var h1 = uint32(seed)
@@ -217,59 +175,57 @@ type Data struct {
 	Args      Args
 }
 
-func VdfAsync(data Data) (int, int64, int, string, uint32) {
+func VdfAsync(data Data) (int, int64, int, string, uint32, error) {
+	return VdfAsyncContext(context.Background(), data)
+}
+
+// Bounds prevent malformed remote challenges from exhausting CPU or memory.
+func validateProof(data Data) (*big.Int, *big.Int, error) {
+	invalid := &RequestError{Operation: "proof parameters", Kind: ErrUnexpectedResponse}
+	if data.MinTime < 0 || data.MaxTime <= 0 || data.MinTime > data.MaxTime || data.MaxTime > 60000 ||
+		data.Args.T < 0 || data.Args.T > 10000000 || len(data.Args.X) > 1024 || len(data.Args.Mod) > 1024 {
+		return nil, nil, invalid
+	}
+	x, ok := new(big.Int).SetString(data.Args.X, 16)
+	if !ok || x.Sign() < 0 {
+		return nil, nil, invalid
+	}
+	mod, ok := new(big.Int).SetString(data.Args.Mod, 16)
+	if !ok || mod.Cmp(big.NewInt(1)) <= 0 {
+		return nil, nil, invalid
+	}
+	return x, mod, nil
+}
+
+func VdfAsyncContext(ctx context.Context, data Data) (int, int64, int, string, uint32, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, 0, 0, "", 0, err
+	}
+	bigx, bigmod, err := validateProof(data)
+	if err != nil {
+		return 0, 0, 0, "", 0, err
+	}
 	startTime := time.Now()
-
-	// 解析大整数
-	bigx, ok := new(big.Int).SetString(data.Args.X, 16)
-	if !ok {
-		panic("解析 x 失败")
-	}
-	bigmod, ok := new(big.Int).SetString(data.Args.Mod, 16)
-	if !ok {
-		panic("解析 mod 失败")
-	}
-
 	count := 0
-	tmp := new(big.Int)
-	sq := new(big.Int)
-
+	tmp, sq := new(big.Int), new(big.Int)
 	for i := 0; i < data.Args.T || time.Since(startTime).Milliseconds() < data.MinTime; i++ {
-		// bigx = bigx * bigx % bigmod
+		if i%256 == 0 {
+			if err := ctx.Err(); err != nil {
+				return 0, 0, 0, "", 0, err
+			}
+		}
 		sq.Mul(bigx, bigx)
 		tmp.Mod(sq, bigmod)
 		bigx.Set(tmp)
-
 		count++
-
 		if time.Since(startTime).Milliseconds() > data.MaxTime {
 			break
 		}
 	}
-
-	timeSpent := time.Since(startTime).Milliseconds()
-
-	signObj := map[string]any{
-		"runTimes":  count,
-		"spendTime": timeSpent,
-		"t":         count,
-		"x":         strings.ToLower(bigx.Text(16)),
+	if err := ctx.Err(); err != nil {
+		return 0, 0, 0, "", 0, err
 	}
-
-	// 排序参数
-	sortedParams := []string{"runTimes", "spendTime", "t", "x"}
-	var encodedParams []string
-	for _, key := range sortedParams {
-		value := fmt.Sprintf("%v", signObj[key])
-		encodedParams = append(encodedParams, url.QueryEscape(key)+"="+url.QueryEscape(value))
-	}
-	joined := strings.Join(encodedParams, "&")
-
-	sign := PowSign(joined, count)
-
-	//fmt.Println("Result x:", bigx.Text(16))
-	fmt.Println("SignObj:", signObj)
-	fmt.Println("EncodedParams:", joined)
-	fmt.Println("Sign:", sign)
-	return count, timeSpent, count, bigx.Text(16), sign
+	elapsed := time.Since(startTime).Milliseconds()
+	joined := "runTimes=" + strconv.Itoa(count) + "&spendTime=" + strconv.FormatInt(elapsed, 10) + "&t=" + strconv.Itoa(count) + "&x=" + url.QueryEscape(bigx.Text(16))
+	return count, elapsed, count, bigx.Text(16), PowSign(joined, count), nil
 }

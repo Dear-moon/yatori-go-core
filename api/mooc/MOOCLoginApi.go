@@ -1,21 +1,23 @@
 package mooc
 
 import (
-	"crypto/tls"
-	"fmt"
-	"io/ioutil"
+	"context"
+	"encoding/json"
+	"errors"
 	"net/http"
-	"net/url"
+	"net/http/cookiejar"
 	"strings"
+	"sync"
+	"time"
 
-	"github.com/thedevsaddam/gojsonq"
-	"github.com/yatori-dev/yatori-go-core/utils"
+	"golang.org/x/net/publicsuffix"
 )
 
+// MOOCUserCache retains the experimental entry points; methods now return errors.
 type MOOCUserCache struct {
-	Account   string //账号
-	Password  string //用户密码
-	TK        string //通过GT获取的参数
+	Account   string
+	Password  string
+	TK        string
 	Sid       string
 	X         string
 	T         int
@@ -23,272 +25,294 @@ type MOOCUserCache struct {
 	Mod       string
 	MinTime   int64
 	MaxTime   int64
-	IpProxySW bool   //是否开启IP代理
-	ProxyIP   string //代理IP
-	cookies   []*http.Cookie
+	IpProxySW bool
+	ProxyIP   string
+	Timeout   time.Duration
+
+	// ProofSessionID must come from the normal initialization flow, not a fixed sample.
+	ProofSessionID string
+	mu             sync.Mutex
+	client         *MOOCClient
 }
 
-// 用于初始化Cookie参数
-func (cache *MOOCUserCache) InitCookiesApi() {
+type proofParameters struct {
+	MaxTime int64  `json:"maxTime"`
+	MinTime int64  `json:"minTime"`
+	Sid     string `json:"sid"`
+	Args    struct {
+		Puzzle string `json:"puzzle"`
+		X      string `json:"x"`
+		T      int    `json:"t"`
+		Mod    string `json:"mod"`
+	} `json:"args"`
+}
 
-	urlStr := "https://www.icourse163.org/member/login.htm"
-	method := "GET"
+func (p proofParameters) data() Data {
+	return Data{NeedCheck: true, Sid: p.Sid, HashFunc: "VDF_FUNCTION",
+		MaxTime: p.MaxTime, MinTime: p.MinTime,
+		Args: Args{Puzzle: p.Args.Puzzle, X: p.Args.X, T: p.Args.T, Mod: p.Args.Mod}}
+}
 
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true, // 跳过证书验证，仅用于开发环境
-		},
+func (c *MOOCClient) post(ctx context.Context, operation, path, params string) ([]byte, error) {
+	encrypted, err := MOOCEncMS4(params)
+	if err != nil {
+		return nil, &RequestError{Operation: operation, Kind: ErrRequestFailed, cause: err}
 	}
+	payload, err := json.Marshal(struct {
+		EncParams string `json:"encParams"`
+	}{encrypted})
+	if err != nil {
+		return nil, &RequestError{Operation: operation, Kind: ErrRequestFailed, cause: err}
+	}
+	return c.request(ctx, operation, http.MethodPost, authBaseURL+path, payload, true)
+}
 
-	//如果开启了IP代理，那么就直接添加代理
-	if cache.IpProxySW {
-		tr.Proxy = func(req *http.Request) (*url.URL, error) {
-			return url.Parse("http://" + cache.ProxyIP) // 设置代理
+func decodeResponse(operation string, body []byte, target any) error {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(body, &object); err != nil || object == nil {
+		return &RequestError{Operation: operation, Kind: ErrUnexpectedResponse}
+	}
+	if err := json.Unmarshal(body, target); err != nil {
+		return &RequestError{Operation: operation, Kind: ErrUnexpectedResponse}
+	}
+	return nil
+}
+
+func (c *MOOCClient) initCookies(ctx context.Context) error {
+	c.initialized = false
+	c.tk = ""
+	c.proof = proofParameters{}
+	if err := c.resetCookies(); err != nil {
+		return err
+	}
+	if _, err := c.request(ctx, "initialize", http.MethodGet, loginPageURL, nil, false); err != nil {
+		return err
+	}
+	rtid, err := BuildRtId()
+	if err != nil {
+		return err
+	}
+	body, err := c.post(ctx, "initialize", "ini",
+		BuildDLInitParams("imooc", "cjJVGQM", "www.icourse163.org", 1, loginPageURL, rtid))
+	if err != nil {
+		return err
+	}
+	var result map[string]json.RawMessage
+	if err := decodeResponse("initialize", body, &result); err != nil {
+		return err
+	}
+	c.initialized = true
+	return nil
+}
+
+func (c *MOOCClient) gt(ctx context.Context) error {
+	c.tk = ""
+	c.proof = proofParameters{}
+	if !c.initialized {
+		return &RequestError{Operation: "gt", Kind: ErrSessionExpired}
+	}
+	rtid, err := BuildRtId()
+	if err != nil {
+		return err
+	}
+	body, err := c.post(ctx, "gt", "gt", BuildGTParams(c.account, 1, "imooc", "cjJVGQM", loginPageURL, rtid))
+	if err != nil {
+		return err
+	}
+	var result struct {
+		Ret string `json:"ret"`
+		TK  string `json:"tk"`
+	}
+	if err := decodeResponse("gt", body, &result); err != nil {
+		return err
+	}
+	if result.Ret == "" {
+		return &RequestError{Operation: "gt", Kind: ErrUnexpectedResponse}
+	}
+	if result.Ret != "201" {
+		return &RequestError{Operation: "gt", Kind: ErrRemoteRejected}
+	}
+	if result.TK == "" {
+		return &RequestError{Operation: "gt", Kind: ErrUnexpectedResponse}
+	}
+	c.tk = result.TK
+	return nil
+}
+
+func (c *MOOCClient) powGetP(ctx context.Context, proofSessionID string) error {
+	c.proof = proofParameters{}
+	if !c.initialized || c.tk == "" {
+		return &RequestError{Operation: "pow", Kind: ErrSessionExpired}
+	}
+	if strings.TrimSpace(proofSessionID) == "" {
+		return &RequestError{Operation: "pow session identifier", Kind: ErrNeedsUserAction}
+	}
+	rtid, err := BuildRtId()
+	if err != nil {
+		return err
+	}
+	body, err := c.post(ctx, "pow", "powGetP",
+		BuildPowGetPParams("imooc", "cjJVGQM", c.account, proofSessionID, 1, proofTopURL, rtid))
+	if err != nil {
+		return err
+	}
+	var result struct {
+		Ret   string           `json:"ret"`
+		Proof *proofParameters `json:"pVInfo"`
+	}
+	if err := decodeResponse("pow", body, &result); err != nil {
+		return err
+	}
+	if result.Ret == "" {
+		return &RequestError{Operation: "pow", Kind: ErrUnexpectedResponse}
+	}
+	if result.Ret != "201" {
+		return &RequestError{Operation: "pow", Kind: ErrRemoteRejected}
+	}
+	if result.Proof == nil || result.Proof.Sid == "" || result.Proof.Args.Puzzle == "" {
+		return &RequestError{Operation: "pow", Kind: ErrUnexpectedResponse}
+	}
+	if _, _, err := validateProof(result.Proof.data()); err != nil {
+		return err
+	}
+	c.proof = *result.Proof
+	return nil
+}
+
+func (c *MOOCClient) submitLogin(ctx context.Context, password string) error {
+	if !c.initialized || c.tk == "" || c.proof.Sid == "" {
+		return &RequestError{Operation: "login", Kind: ErrSessionExpired}
+	}
+	if password == "" {
+		return &RequestError{Operation: "login", Kind: ErrAuthenticationFailed}
+	}
+	runTimes, spendTime, iterations, x, sign, err := VdfAsyncContext(ctx, c.proof.data())
+	if err != nil {
+		return err
+	}
+	encryptedPassword, err := MOOCRSA(password)
+	if err != nil {
+		return err
+	}
+	rtid, err := BuildRtId()
+	if err != nil {
+		return err
+	}
+	params := BuildLParams(1, 10, c.account, encryptedPassword, "imooc", "cjJVGQM", c.tk,
+		"", c.proof.Args.Puzzle, int(spendTime), runTimes, c.proof.Sid, x, iterations, int(sign), 1, loginPageURL, rtid)
+	// The challenge is single-use even when the request outcome is unknown.
+	c.proof = proofParameters{}
+	body, err := c.post(ctx, "login", "pwd/l", params)
+	if err != nil {
+		return err
+	}
+	var response map[string]json.RawMessage
+	if err := decodeResponse("login", body, &response); err != nil {
+		return err
+	}
+	// No verified final response schema or identity endpoint exists in the source evidence.
+	return &RequestError{Operation: "login identity", Kind: ErrAuthenticationUnverified}
+}
+
+func (c *MOOCClient) InitCookies(ctx context.Context) error {
+	return c.run(ctx, c.initCookies)
+}
+
+func (c *MOOCClient) Gt(ctx context.Context) error {
+	return c.run(ctx, c.gt)
+}
+
+func (c *MOOCClient) PowGetP(ctx context.Context, proofSessionID string) error {
+	return c.run(ctx, func(ctx context.Context) error { return c.powGetP(ctx, proofSessionID) })
+}
+
+func (c *MOOCClient) SubmitLogin(ctx context.Context, password string) error {
+	return c.run(ctx, func(ctx context.Context) error { return c.submitLogin(ctx, password) })
+}
+
+// Login prepares the known protocol stages but cannot yet verify authenticated identity.
+func (c *MOOCClient) Login(ctx context.Context, password, proofSessionID string) error {
+	return c.run(ctx, func(ctx context.Context) error {
+		if strings.TrimSpace(proofSessionID) == "" {
+			return &RequestError{Operation: "pow session identifier", Kind: ErrNeedsUserAction}
 		}
-	}
-	client := &http.Client{
-		Transport: tr,
-	}
-	req, err := http.NewRequest(method, urlStr, nil)
-
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	req.Header.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36")
-	req.Header.Add("Accept", "*/*")
-	req.Header.Add("Host", "www.icourse163.org")
-	req.Header.Add("Connection", "keep-alive")
-	req.Header.Add("Referer", "https://www.icourse163.org/member/login.htm")
-
-	res, err := client.Do(req)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	defer res.Body.Close()
-	utils.CookiesAddNoRepetition(&cache.cookies, res.Cookies())
-
-	encStr2 := MOOCEncMS4(BuildDLInitParams("imooc", "cjJVGQM", "www.icourse163.org", 1, "https://www.icourse163.org/member/login.htm", BuildRtId()))
-	url2 := "https://reg.icourse163.org/dl/zj/yd/ini"
-	method2 := "POST"
-
-	payload2 := strings.NewReader(`{"encParams":"` + encStr2 + `"}`)
-
-	client2 := &http.Client{}
-	req2, err2 := http.NewRequest(method2, url2, payload2)
-	for _, cookie := range cache.cookies {
-		req2.AddCookie(cookie)
-	}
-	if err2 != nil {
-		fmt.Println(err2)
-		return
-	}
-	req2.Header.Add("Origin", "https://reg.icourse163.org")
-	req2.Header.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36")
-	req2.Header.Add("Content-Type", "application/json")
-	req2.Header.Add("Accept", "*/*")
-	req2.Header.Add("Host", "reg.icourse163.org")
-	req2.Header.Add("Connection", "keep-alive")
-
-	res2, err2 := client2.Do(req2)
-	if err2 != nil {
-		fmt.Println(err2)
-		return
-	}
-	defer res2.Body.Close()
-
-	body2, err2 := ioutil.ReadAll(res2.Body)
-	if err2 != nil {
-		fmt.Println(err2)
-		return
-	}
-	fmt.Println(string(body2))
-	utils.CookiesAddNoRepetition(&cache.cookies, res2.Cookies())
-}
-
-// powGetP 接口
-func (cache *MOOCUserCache) PowGetPApi() {
-
-	urlStr := "https://reg.icourse163.org/dl/zj/yd/powGetP"
-	method := "POST"
-	encStr := MOOCEncMS4(BuildPowGetPParams("imooc", "cjJVGQM", "18973485974", "5722fb36-7665-4510-8281-c202f414978c", 1, "https://www.icourse163.org/member/login.htm?returnUrl=aHR0cHM6Ly93d3cuaWNvdXJzZTE2My5vcmcvaW5kZXguaHRt#/webLoginIndex", BuildRtId()))
-	payload := strings.NewReader(`{"encParams":"` + encStr + `"}`)
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true, // 跳过证书验证，仅用于开发环境
-		},
-	}
-
-	//如果开启了IP代理，那么就直接添加代理
-	if cache.IpProxySW {
-		tr.Proxy = func(req *http.Request) (*url.URL, error) {
-			return url.Parse("http://" + cache.ProxyIP) // 设置代理
+		if err := c.initCookies(ctx); err != nil {
+			return err
 		}
-	}
-	client := &http.Client{
-		Transport: tr,
-	}
-	req, err := http.NewRequest(method, urlStr, payload)
-
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-
-	for _, cookie := range cache.cookies {
-		req.AddCookie(cookie)
-	}
-	req.Header.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36")
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("Accept", "*/*")
-	req.Header.Add("Host", "reg.icourse163.org")
-	req.Header.Add("Connection", "keep-alive")
-
-	res, err := client.Do(req)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	defer res.Body.Close()
-
-	body, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	if gojsonq.New().JSONString(string(body)).Find("ret").(string) == "201" {
-		cache.MaxTime = int64(gojsonq.New().JSONString(string(body)).Find("pVInfo.maxTime").(float64))
-		cache.MinTime = int64(gojsonq.New().JSONString(string(body)).Find("pVInfo.minTime").(float64))
-		cache.Sid = gojsonq.New().JSONString(string(body)).Find("pVInfo.sid").(string)
-		cache.Puzzle = gojsonq.New().JSONString(string(body)).Find("pVInfo.args.puzzle").(string)
-		cache.X = gojsonq.New().JSONString(string(body)).Find("pVInfo.args.x").(string)
-		cache.T = int(gojsonq.New().JSONString(string(body)).Find("pVInfo.args.t").(float64))
-		cache.Mod = gojsonq.New().JSONString(string(body)).Find("pVInfo.args.mod").(string)
-	}
-	fmt.Println(string(body))
-}
-
-func (cache *MOOCUserCache) GtApi() {
-
-	urlStr := "https://reg.icourse163.org/dl/zj/yd/gt"
-	method := "POST"
-	encStr := MOOCEncMS4(BuildGTParams(cache.Account, 1, "imooc", "cjJVGQM", "https://www.icourse163.org/member/login.htm", BuildRtId()))
-	payload := strings.NewReader(`{"encParams":"` + encStr + `"}`)
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true, // 跳过证书验证，仅用于开发环境
-		},
-	}
-
-	//如果开启了IP代理，那么就直接添加代理
-	if cache.IpProxySW {
-		tr.Proxy = func(req *http.Request) (*url.URL, error) {
-			return url.Parse("http://" + cache.ProxyIP) // 设置代理
+		if err := c.gt(ctx); err != nil {
+			return err
 		}
-	}
-	client := &http.Client{
-		Transport: tr,
-	}
-	req, err := http.NewRequest(method, urlStr, payload)
-
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	for _, cookie := range cache.cookies {
-		req.AddCookie(cookie)
-	}
-	req.Header.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36")
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("Accept", "*/*")
-	req.Header.Add("Host", "reg.icourse163.org")
-	req.Header.Add("Connection", "keep-alive")
-
-	res, err := client.Do(req)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	defer res.Body.Close()
-
-	body, err := ioutil.ReadAll(res.Body)
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-	fmt.Println(string(body))
-	if gojsonq.New().JSONString(string(body)).Find("ret").(string) == "201" {
-		cache.TK = gojsonq.New().JSONString(string(body)).Find("tk").(string)
-	}
-	utils.CookiesAddNoRepetition(&cache.cookies, res.Cookies())
-}
-
-func (cache *MOOCUserCache) LoginApi() {
-
-	urlStr := "https://reg.icourse163.org/dl/zj/yd/pwd/l"
-	method := "POST"
-
-	runTimes, spendTime, T, X, sign := VdfAsync(Data{
-		NeedCheck: true,
-		Sid:       cache.Sid,
-		HashFunc:  "VDF_FUNCTION",
-		MaxTime:   cache.MaxTime,
-		MinTime:   cache.MinTime,
-		Args: Args{
-			Mod:    cache.Mod,
-			T:      cache.T,
-			Puzzle: cache.Puzzle,
-			X:      cache.X,
-		},
+		if err := c.powGetP(ctx, proofSessionID); err != nil {
+			return err
+		}
+		return c.submitLogin(ctx, password)
 	})
-	buildParams := BuildLParams(1, 10, cache.Account, MOOCRSA(cache.Password), "imooc", "cjJVGQM", cache.TK, "", cache.Puzzle, int(spendTime), runTimes, cache.Sid, X, T, int(sign), 1, "https://www.icourse163.org/member/login.htm", BuildRtId())
-	encStr := MOOCEncMS4(buildParams)
-	payload := strings.NewReader(`{"encParams":"` + encStr + `"}`)
+}
 
-	tr := &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true, // 跳过证书验证，仅用于开发环境
-		},
-	}
-
-	//如果开启了IP代理，那么就直接添加代理
-	if cache.IpProxySW {
-		tr.Proxy = func(req *http.Request) (*url.URL, error) {
-			return url.Parse("http://" + cache.ProxyIP) // 设置代理
+func (cache *MOOCUserCache) clientForSession() (*MOOCClient, error) {
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
+	if cache.client != nil {
+		if cache.client.account != cache.Account || cache.client.options.IpProxySW != cache.IpProxySW ||
+			cache.client.options.ProxyIP != cache.ProxyIP {
+			return nil, errors.New("create a new MOOCUserCache after changing account or proxy")
 		}
+		return cache.client, nil
 	}
-	client := &http.Client{
-		Transport: tr,
-	}
-	req, err := http.NewRequest(method, urlStr, payload)
-
+	client, err := NewMOOCClient(cache.Account, ClientOptions{Timeout: cache.Timeout, IpProxySW: cache.IpProxySW, ProxyIP: cache.ProxyIP})
 	if err != nil {
-		fmt.Println(err)
-		return
+		return nil, err
 	}
-	for _, cookie := range cache.cookies {
-		req.AddCookie(cookie)
-	}
+	cache.client = client
+	return client, nil
+}
 
-	req.Header.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36")
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("Accept", "*/*")
-	req.Header.Add("Host", "reg.icourse163.org")
-	req.Header.Add("Connection", "keep-alive")
-
-	res, err := client.Do(req)
+func (cache *MOOCUserCache) call(ctx context.Context, operation func(*MOOCClient, context.Context) error) error {
+	c, err := cache.clientForSession()
 	if err != nil {
-		fmt.Println(err)
-		return
+		return err
 	}
-	defer res.Body.Close()
+	return c.run(ctx, func(ctx context.Context) error {
+		err := operation(c, ctx)
+		cache.TK, cache.Sid = c.tk, c.proof.Sid
+		cache.X, cache.T, cache.Puzzle, cache.Mod = c.proof.Args.X, c.proof.Args.T, c.proof.Args.Puzzle, c.proof.Args.Mod
+		cache.MinTime, cache.MaxTime = c.proof.MinTime, c.proof.MaxTime
+		return err
+	})
+}
 
-	body, err := ioutil.ReadAll(res.Body)
+func (cache *MOOCUserCache) InitCookiesApiContext(ctx context.Context) error {
+	return cache.call(ctx, func(c *MOOCClient, ctx context.Context) error { return c.initCookies(ctx) })
+}
+func (cache *MOOCUserCache) GtApiContext(ctx context.Context) error {
+	return cache.call(ctx, func(c *MOOCClient, ctx context.Context) error { return c.gt(ctx) })
+}
+func (cache *MOOCUserCache) PowGetPApiContext(ctx context.Context) error {
+	return cache.call(ctx, func(c *MOOCClient, ctx context.Context) error { return c.powGetP(ctx, cache.ProofSessionID) })
+}
+func (cache *MOOCUserCache) LoginApiContext(ctx context.Context) error {
+	return cache.call(ctx, func(c *MOOCClient, ctx context.Context) error { return c.submitLogin(ctx, cache.Password) })
+}
+
+// Deprecated: use InitCookiesApiContext to control cancellation.
+func (cache *MOOCUserCache) InitCookiesApi() error {
+	return cache.InitCookiesApiContext(context.Background())
+}
+
+// Deprecated: use GtApiContext to control cancellation.
+func (cache *MOOCUserCache) GtApi() error { return cache.GtApiContext(context.Background()) }
+
+// Deprecated: use PowGetPApiContext to control cancellation.
+func (cache *MOOCUserCache) PowGetPApi() error { return cache.PowGetPApiContext(context.Background()) }
+
+// Deprecated: use LoginApiContext to control cancellation.
+func (cache *MOOCUserCache) LoginApi() error { return cache.LoginApiContext(context.Background()) }
+
+func (c *MOOCClient) resetCookies() error {
+	jar, err := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
 	if err != nil {
-		fmt.Println(err)
-		return
+		return &RequestError{Operation: "initialize", Kind: ErrRequestFailed, cause: err}
 	}
-	fmt.Println(string(body))
-	utils.CookiesAddNoRepetition(&cache.cookies, res.Cookies())
+	c.httpClient.Jar = jar
+	return nil
 }

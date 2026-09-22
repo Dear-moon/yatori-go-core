@@ -75,43 +75,7 @@ func (c *MOOCClient) ReportVideoProgress(ctx context.Context, progress VideoProg
 		if err != nil {
 			return invalid
 		}
-		token := c.csrfCookie()
-		if token == "" {
-			return &RequestError{Operation: "video progress CSRF", Kind: ErrUnexpectedResponse}
-		}
-		headers, err := rpcAuthHeaders(payload)
-		if err != nil {
-			return err
-		}
-		headers.Set("edu-script-token", token)
-		headers.Set("Referer", siteURL)
-		body, err := c.requestWithHeaders(ctx, "video progress", http.MethodPost, siteURL+"web/j/courseRpcBean.saveMocContentLearn.rpc?"+url.Values{"csrfKey": {token}}.Encode(), payload, true, headers)
-		if err != nil {
-			return err
-		}
-		var response struct {
-			Code   *int  `json:"code"`
-			Result *bool `json:"result"`
-		}
-		if err := decodeResponse("video progress", body, &response); err != nil {
-			return err
-		}
-		if response.Code == nil {
-			return &RequestError{Operation: "video progress schema", Kind: ErrUnexpectedResponse}
-		}
-		if *response.Code == 1 {
-			return c.unauthenticated("video progress")
-		}
-		if *response.Code != 0 {
-			return &RequestError{Operation: "video progress", Kind: ErrRemoteRejected}
-		}
-		if response.Result == nil {
-			return &RequestError{Operation: "video progress receipt", Kind: ErrUnexpectedResponse}
-		}
-		if !*response.Result {
-			return &RequestError{Operation: "video progress receipt", Kind: ErrRemoteRejected}
-		}
-		return nil
+		return c.reportContentProgress(ctx, "video progress", payload)
 	})
 }
 
@@ -131,4 +95,44 @@ func rpcAuthHeaders(payload []byte) (http.Header, error) {
 		"System":         {"v1"},
 		"Auth-Signature": {strings.ToUpper(hex.EncodeToString(sum[:]))},
 	}, nil
+}
+
+func (c *MOOCClient) reportContentProgress(ctx context.Context, operation string, payload []byte) error {
+	token := c.csrfCookie()
+	if token == "" {
+		return &RequestError{Operation: operation + " CSRF", Kind: ErrUnexpectedResponse}
+	}
+	headers, err := rpcAuthHeaders(payload)
+	if err != nil {
+		return err
+	}
+	headers.Set("edu-script-token", token)
+	headers.Set("Referer", siteURL)
+	body, err := c.requestWithHeaders(ctx, operation, http.MethodPost, siteURL+"web/j/courseRpcBean.saveMocContentLearn.rpc?"+url.Values{"csrfKey": {token}}.Encode(), payload, true, headers)
+	if err != nil {
+		return err
+	}
+	var response struct {
+		Code   *int  `json:"code"`
+		Result *bool `json:"result"`
+	}
+	if err := decodeResponse(operation, body, &response); err != nil {
+		return err
+	}
+	if response.Code == nil {
+		return &RequestError{Operation: operation + " schema", Kind: ErrUnexpectedResponse}
+	}
+	if *response.Code == 1 {
+		return c.unauthenticated(operation)
+	}
+	if *response.Code != 0 {
+		return &RequestError{Operation: operation, Kind: ErrRemoteRejected}
+	}
+	if response.Result == nil {
+		return &RequestError{Operation: operation + " receipt", Kind: ErrUnexpectedResponse}
+	}
+	if !*response.Result {
+		return &RequestError{Operation: operation + " receipt", Kind: ErrRemoteRejected}
+	}
+	return nil
 }

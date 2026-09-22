@@ -80,6 +80,10 @@ func NewMOOCClient(account string, options ClientOptions) (*MOOCClient, error) {
 	if strings.TrimSpace(account) == "" {
 		return nil, errors.New("MOOC account is required")
 	}
+	return newMOOCClient(account, options)
+}
+
+func newMOOCClient(account string, options ClientOptions) (*MOOCClient, error) {
 	if options.Timeout < 0 {
 		return nil, errors.New("MOOC timeout must be positive")
 	}

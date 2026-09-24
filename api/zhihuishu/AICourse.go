@@ -25,6 +25,48 @@ type Resource struct {
 	DurationSeconds  string
 	BookPageCount    int
 	HasBookContent   bool
+	FileSuffix       string
+	LocalType        int
+	QuoteFileType    int
+	PPTPages         []int
+}
+
+type ResourceKind string
+
+const (
+	ResourceUnknown ResourceKind = "unknown"
+	ResourceVideo   ResourceKind = "video"
+	ResourceBook    ResourceKind = "book"
+	ResourcePPT     ResourceKind = "ppt"
+)
+
+// Kind distinguishes files that share the platform's generic resource data type.
+func (r Resource) Kind() ResourceKind {
+	if r.DataType == 21 {
+		return ResourceBook
+	}
+	if r.DataType != 11 && r.DataType != 22 {
+		return ResourceUnknown
+	}
+	suffix := strings.ToLower(strings.TrimPrefix(strings.TrimSpace(r.FileSuffix), "."))
+	if suffix == "ppt" || suffix == "pptx" {
+		if r.QuoteFileType == 0 || r.QuoteFileType == 2 {
+			return ResourcePPT
+		}
+		return ResourceUnknown
+	}
+	if r.QuoteFileType != 0 && r.QuoteFileType != 1 {
+		return ResourceUnknown
+	}
+	switch suffix {
+	case "mp4", "mpeg2", "wmv", "avi", "flv", "mov", "svga", "apng", "flash", "m4v":
+		return ResourceVideo
+	case "":
+		if r.QuoteFileType == 1 || r.DataType == 22 {
+			return ResourceVideo
+		}
+	}
+	return ResourceUnknown
 }
 
 // AICourses lists the AI course product observed in the authenticated student portal.
@@ -165,16 +207,22 @@ func (c *Client) Resources(ctx context.Context, course AICourse, knowledgeID str
 		var response struct {
 			Resources *[]struct {
 				Detail *struct {
-					ID       string `json:"resourcesUid"`
-					Name     string `json:"resourcesName"`
-					FileID   string `json:"resourcesFileId"`
-					DataType *int   `json:"resourcesDataType"`
-					Duration string `json:"resourcesTime"`
+					ID        string `json:"resourcesUid"`
+					Name      string `json:"resourcesName"`
+					FileID    string `json:"resourcesFileId"`
+					DataType  *int   `json:"resourcesDataType"`
+					Duration  string `json:"resourcesTime"`
+					Suffix    string `json:"resourcesSuffix"`
+					LocalType int    `json:"resourcesLocalType"`
 				} `json:"resourcesDetail"`
 				Book *struct {
 					Content *string           `json:"mdContent"`
 					Pages   []json.RawMessage `json:"pageList"`
 				} `json:"resourcesBookDetail"`
+				Quote *struct {
+					FileType int   `json:"fileType"`
+					Pages    []int `json:"pptPageSeqs"`
+				} `json:"resourcesQuoteDetail"`
 				Status *int `json:"studyStatus"`
 			} `json:"resourceList"`
 		}
@@ -189,7 +237,11 @@ func (c *Client) Resources(ctx context.Context, course AICourse, knowledgeID str
 			if r.Detail == nil || r.Detail.ID == "" || r.Detail.DataType == nil || r.Status == nil {
 				return ErrUnexpectedResponse
 			}
-			item := Resource{ID: r.Detail.ID, Name: r.Detail.Name, FileID: r.Detail.FileID, DataType: *r.Detail.DataType, Status: *r.Status, DurationSeconds: r.Detail.Duration}
+			item := Resource{ID: r.Detail.ID, Name: r.Detail.Name, FileID: r.Detail.FileID, DataType: *r.Detail.DataType, Status: *r.Status, DurationSeconds: r.Detail.Duration, FileSuffix: r.Detail.Suffix, LocalType: r.Detail.LocalType}
+			if r.Quote != nil {
+				item.QuoteFileType = r.Quote.FileType
+				item.PPTPages = append([]int(nil), r.Quote.Pages...)
+			}
 			if r.Book != nil {
 				item.BookPageCount = len(r.Book.Pages)
 				item.HasBookContent = item.BookPageCount > 0 || (r.Book.Content != nil && strings.TrimSpace(*r.Book.Content) != "")

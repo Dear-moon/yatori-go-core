@@ -23,6 +23,7 @@ type MOOCUnit struct {
 	Name            string
 	ContentType     int
 	DurationSeconds *int
+	ViewStatus      *int
 }
 type chapterDTO struct {
 	ID      protocolID `json:"id"`
@@ -36,6 +37,7 @@ type chapterDTO struct {
 			Name        string     `json:"name"`
 			ContentType *int       `json:"contentType"`
 			Duration    *int       `json:"durationInSeconds"`
+			ViewStatus  *int       `json:"viewStatus"`
 		} `json:"units"`
 	} `json:"lessons"`
 }
@@ -80,7 +82,7 @@ func (c *MOOCClient) Chapters(ctx context.Context, termID string) ([]MOOCChapter
 						return invalid
 					}
 					seen[string(un.ID)] = true
-					lesson.Units = append(lesson.Units, MOOCUnit{ID: string(un.ID), ContentID: string(un.ContentID), Name: un.Name, ContentType: *un.ContentType, DurationSeconds: un.Duration})
+					lesson.Units = append(lesson.Units, MOOCUnit{ID: string(un.ID), ContentID: string(un.ContentID), Name: un.Name, ContentType: *un.ContentType, DurationSeconds: un.Duration, ViewStatus: un.ViewStatus})
 				}
 				chapter.Lessons = append(chapter.Lessons, lesson)
 			}

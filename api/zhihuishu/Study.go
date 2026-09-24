@@ -2,6 +2,7 @@ package zhihuishu
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -10,7 +11,7 @@ import (
 
 // StudyVideo reports elapsed time in intervals matching the student player.
 func (c *Client) StudyVideo(ctx context.Context, course AICourse, knowledgeID string, resource Resource, onProgress func(int, int)) error {
-	if resource.DataType != 11 || resource.ID == "" || resource.FileID == "" {
+	if resource.Kind() != ResourceVideo || resource.ID == "" || resource.FileID == "" {
 		return ErrUnsupportedResource
 	}
 	open, err := c.StudyOpen(ctx, course)
@@ -30,15 +31,16 @@ func (c *Client) StudyVideo(ctx context.Context, course AICourse, knowledgeID st
 		params["resourcesUid"] = resource.ID
 		var detail struct {
 			Quote *struct {
-				Start string `json:"videoStartTime"`
-				End   string `json:"videoEndTime"`
+				FileType int    `json:"fileType"`
+				Start    string `json:"videoStartTime"`
+				End      string `json:"videoEndTime"`
 			} `json:"resourcesQuoteDetail"`
 			Video any `json:"resourcesVideoDetail"`
 		}
 		if err := c.aiRequest(ctx, "video detail", "/stu/resources/get-node-resources-detail", params, &detail); err != nil {
 			return err
 		}
-		if detail.Video != nil {
+		if detail.Video != nil || (detail.Quote != nil && detail.Quote.FileType != 0 && detail.Quote.FileType != 1) {
 			return ErrUnsupportedResource
 		}
 		params, _ = courseParams(course)
@@ -56,7 +58,10 @@ func (c *Client) StudyVideo(ctx context.Context, course AICourse, knowledgeID st
 				total = duration.Time
 			}
 		}
-		if total <= 0 || total > 86400 {
+		if total == 0 {
+			return &RequestError{Operation: "video unavailable", Kind: ErrUnsupportedResource}
+		}
+		if total < 0 || total > 86400 {
 			return ErrUnexpectedResponse
 		}
 		params, _ = resourceParams(course, knowledgeID)
@@ -175,4 +180,110 @@ func (c *Client) CompleteBook(ctx context.Context, course AICourse, knowledgeID 
 		params["watchUId"] = 1
 		return c.aiRequest(ctx, "book preview", "/stu/studyRecord/completed", params, nil)
 	})
+}
+
+// CompletePPT verifies the preview before sending the same receipt as the web reader.
+func (c *Client) CompletePPT(ctx context.Context, course AICourse, knowledgeID string, resource Resource) error {
+	if resource.Kind() != ResourcePPT || resource.ID == "" {
+		return ErrUnsupportedResource
+	}
+	open, err := c.StudyOpen(ctx, course)
+	if err != nil {
+		return err
+	}
+	if !open {
+		return ErrStudyClosed
+	}
+	resources, err := c.Resources(ctx, course, knowledgeID)
+	if err != nil {
+		return err
+	}
+	var loaded *Resource
+	for i := range resources {
+		if resources[i].ID == resource.ID && resources[i].Kind() == ResourcePPT {
+			loaded = &resources[i]
+			break
+		}
+	}
+	if loaded == nil || loaded.LocalType != 1 || len(loaded.PPTPages) == 0 {
+		return ErrUnsupportedResource
+	}
+	if loaded.Status == 1 {
+		return nil
+	}
+	err = c.run(ctx, func(ctx context.Context) error {
+		params, err := resourceParams(course, knowledgeID)
+		if err != nil {
+			return err
+		}
+		params["resourcesUid"] = loaded.ID
+		params["nodeUid"] = knowledgeID
+		var preview struct {
+			CutType *int `json:"pptCutType"`
+			Pages   []struct {
+				Sequence int    `json:"pptPageSeq"`
+				URL      string `json:"pptPageUrl"`
+			} `json:"pptPageList"`
+			DynamicStatus int    `json:"pptDynamicStatus"`
+			DynamicParam  string `json:"pptDynamicParam"`
+		}
+		if err := c.aiRequest(ctx, "PPT preview", "/stu/resources-lab/get-ppt-detail-v2", params, &preview); err != nil {
+			return err
+		}
+		if preview.CutType == nil {
+			return ErrUnexpectedResponse
+		}
+		available := map[int]bool{}
+		switch *preview.CutType {
+		case 0:
+			for _, page := range preview.Pages {
+				if page.Sequence > 0 && validPreviewURL(page.URL) {
+					available[page.Sequence] = true
+				}
+			}
+		case 1:
+			if preview.DynamicStatus != 1 {
+				return ErrUnsupportedResource
+			}
+			var dynamic struct {
+				PageCount int    `json:"pageCount"`
+				Format    string `json:"format"`
+				URL       string `json:"resultUrl"`
+			}
+			if json.Unmarshal([]byte(preview.DynamicParam), &dynamic) != nil || dynamic.PageCount <= 0 || dynamic.PageCount > 10000 || dynamic.Format == "" || !validPreviewURL(dynamic.URL) {
+				return ErrUnexpectedResponse
+			}
+			for page := 1; page <= dynamic.PageCount; page++ {
+				available[page] = true
+			}
+		default:
+			return ErrUnsupportedResource
+		}
+		for _, page := range loaded.PPTPages {
+			if !available[page] {
+				return ErrUnsupportedResource
+			}
+		}
+		delete(params, "nodeUid")
+		params["watchUId"] = 1
+		return c.aiRequest(ctx, "PPT preview receipt", "/stu/studyRecord/completed", params, nil)
+	})
+	if err != nil {
+		return err
+	}
+	resources, err = c.Resources(ctx, course, knowledgeID)
+	if err != nil {
+		return err
+	}
+	for _, current := range resources {
+		if current.ID == resource.ID && current.Kind() == ResourcePPT && current.Status == 1 {
+			return nil
+		}
+	}
+	return &RequestError{Operation: "PPT completion not confirmed", Kind: ErrRemoteRejected}
+}
+
+func validPreviewURL(value string) bool {
+	u, err := url.Parse(value)
+	return err == nil && (u.Scheme == "https" || u.Scheme == "http") && u.Hostname() != "" && u.User == nil
 }

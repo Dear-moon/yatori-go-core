@@ -282,7 +282,7 @@ func TestVideoTimingAndCancellation(t *testing.T) {
 			if _, err := c.LoginBrowserSession(ctx, session); err != nil {
 				t.Fatal(err)
 			}
-			err := c.StudyVideo(ctx, AICourse{ID: "course", ClassID: "class"}, "point", Resource{ID: "resource", FileID: "123", DataType: 11}, func(position, total int) {
+			err := c.StudyVideo(ctx, AICourse{ID: "course", ClassID: "class"}, "point", Resource{ID: "resource", FileID: "123", DataType: 11, FileSuffix: "mp4"}, func(position, total int) {
 				if position < 18 || total != 19 {
 					t.Fatal("resource duration was not mapped to clip position")
 				}
@@ -298,5 +298,122 @@ func TestVideoTimingAndCancellation(t *testing.T) {
 				t.Fatalf("report flow failed: %v, writes=%d", err, writes)
 			}
 		})
+	}
+}
+
+func TestClosedCourseDoesNotWriteProgress(t *testing.T) {
+	c, _ := NewClient(ClientOptions{})
+	defer c.Close()
+	c.httpClient.Transport = offlineTransport(func(r *http.Request) (*http.Response, error) {
+		if strings.Contains(r.URL.Path, "getLoginUserInfo") {
+			return jsonResponse(r, profileFixture), nil
+		}
+		if strings.Contains(r.URL.Path, "is-end-study") {
+			return jsonResponse(r, `{"code":200,"data":true}`), nil
+		}
+		t.Fatal("closed course reached a resource or progress endpoint")
+		return nil, nil
+	})
+	ctx := context.Background()
+	if _, err := c.LoginBrowserSession(ctx, testSession()); err != nil {
+		t.Fatal(err)
+	}
+	course := AICourse{ID: "course", ClassID: "class"}
+	if err := c.StudyVideo(ctx, course, "point", Resource{ID: "resource", FileID: "123", DataType: 11, FileSuffix: "mp4"}, nil); !errors.Is(err, ErrStudyClosed) {
+		t.Fatalf("unexpected result: %v", err)
+	}
+	if err := c.CompleteBook(ctx, course, "point", Resource{ID: "book", DataType: 21}); !errors.Is(err, ErrStudyClosed) {
+		t.Fatalf("unexpected result: %v", err)
+	}
+}
+
+func TestBookRefetchesContentBeforeReceipt(t *testing.T) {
+	c, _ := NewClient(ClientOptions{})
+	defer c.Close()
+	c.httpClient.Transport = offlineTransport(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.Contains(r.URL.Path, "getLoginUserInfo"):
+			return jsonResponse(r, profileFixture), nil
+		case strings.Contains(r.URL.Path, "is-end-study"):
+			return jsonResponse(r, `{"code":200,"data":false}`), nil
+		case strings.Contains(r.URL.Path, "list-knowledge-resource"):
+			return jsonResponse(r, `{"code":200,"data":{"resourceList":[{"resourcesDetail":{"resourcesUid":"book","resourcesName":"Book","resourcesDataType":21},"resourcesBookDetail":{"mdContent":null,"pageList":[]},"studyStatus":0}]}}`), nil
+		default:
+			t.Fatal("missing book content produced a completion write")
+			return nil, nil
+		}
+	})
+	ctx := context.Background()
+	if _, err := c.LoginBrowserSession(ctx, testSession()); err != nil {
+		t.Fatal(err)
+	}
+	err := c.CompleteBook(ctx, AICourse{ID: "course", ClassID: "class"}, "point", Resource{ID: "book", DataType: 21, HasBookContent: true})
+	if !errors.Is(err, ErrUnsupportedResource) {
+		t.Fatalf("unexpected result: %v", err)
+	}
+}
+
+func TestRejectedVideoReceiptStopsReporting(t *testing.T) {
+	c, _ := NewClient(ClientOptions{})
+	defer c.Close()
+	writes := 0
+	callbacks := 0
+	c.httpClient.Transport = offlineTransport(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.Contains(r.URL.Path, "getLoginUserInfo"):
+			return jsonResponse(r, profileFixture), nil
+		case strings.Contains(r.URL.Path, "is-end-study"):
+			return jsonResponse(r, `{"code":200,"data":false}`), nil
+		case strings.Contains(r.URL.Path, "get-node-resources-detail"):
+			return jsonResponse(r, `{"code":200,"data":{}}`), nil
+		case strings.Contains(r.URL.Path, "get-video-time"):
+			return jsonResponse(r, `{"code":200,"data":[{"videoId":123,"time":1}]}`), nil
+		case strings.Contains(r.URL.Path, "get-knowledge-video-time"):
+			return jsonResponse(r, `{"code":200,"data":{}}`), nil
+		case strings.Contains(r.URL.Path, "initVideoNew"):
+			return jsonResponse(r, `{"successful":true,"result":{"lines":[{"lineUrl":"https://example.invalid/video"}]}}`), nil
+		case strings.HasSuffix(r.URL.Path, "/study"):
+			writes++
+			return jsonResponse(r, `{"code":500,"data":null}`), nil
+		default:
+			t.Fatal("rejected receipt was retried or followed by a report")
+			return nil, nil
+		}
+	})
+	ctx := context.Background()
+	if _, err := c.LoginBrowserSession(ctx, testSession()); err != nil {
+		t.Fatal(err)
+	}
+	err := c.StudyVideo(ctx, AICourse{ID: "course", ClassID: "class"}, "point", Resource{ID: "resource", FileID: "123", DataType: 11, FileSuffix: "mp4"}, func(int, int) { callbacks++ })
+	if !errors.Is(err, ErrRemoteRejected) || writes != 1 || callbacks != 1 {
+		t.Fatalf("unexpected result: %v writes=%d callbacks=%d", err, writes, callbacks)
+	}
+}
+
+func TestUnavailableVideoDoesNotWriteProgress(t *testing.T) {
+	c, _ := NewClient(ClientOptions{})
+	defer c.Close()
+	c.httpClient.Transport = offlineTransport(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.Contains(r.URL.Path, "getLoginUserInfo"):
+			return jsonResponse(r, profileFixture), nil
+		case strings.Contains(r.URL.Path, "is-end-study"):
+			return jsonResponse(r, `{"code":200,"data":false}`), nil
+		case strings.Contains(r.URL.Path, "get-node-resources-detail"):
+			return jsonResponse(r, `{"code":200,"data":{"resourcesQuoteDetail":{"videoStartTime":"","videoEndTime":""}}}`), nil
+		case strings.Contains(r.URL.Path, "get-video-time"):
+			return jsonResponse(r, `{"code":200,"data":[{"videoId":123,"time":0}]}`), nil
+		default:
+			t.Fatal("unavailable video reached a playback or progress endpoint")
+			return nil, nil
+		}
+	})
+	ctx := context.Background()
+	if _, err := c.LoginBrowserSession(ctx, testSession()); err != nil {
+		t.Fatal(err)
+	}
+	err := c.StudyVideo(ctx, AICourse{ID: "course", ClassID: "class"}, "point", Resource{ID: "resource", FileID: "123", DataType: 11, FileSuffix: "mp4"}, nil)
+	if !errors.Is(err, ErrUnsupportedResource) {
+		t.Fatalf("unexpected result: %v", err)
 	}
 }

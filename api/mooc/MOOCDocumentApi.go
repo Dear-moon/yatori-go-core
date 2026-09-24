@@ -55,3 +55,81 @@ func (c *MOOCClient) ReportDocumentProgress(ctx context.Context, progress Docume
 		return c.reportContentProgress(ctx, "document progress", payload)
 	})
 }
+
+// CompleteDocument verifies the platform's learned marker after a single completion receipt.
+func (c *MOOCClient) CompleteDocument(ctx context.Context, course MOOCCourse, lesson MOOCLesson, unit MOOCUnit) error {
+	invalid := &RequestError{Operation: "document completion input", Kind: ErrUnexpectedResponse}
+	for _, id := range []string{course.ID, course.TermID, lesson.ID, unit.ID} {
+		if !integerID.MatchString(id) || id[0] == '0' {
+			return invalid
+		}
+	}
+	if unit.ContentType != 3 {
+		return invalid
+	}
+	readStatus := func() (int, error) {
+		chapters, err := c.Chapters(ctx, course.TermID)
+		if err != nil {
+			return 0, err
+		}
+		for _, chapter := range chapters {
+			for _, currentLesson := range chapter.Lessons {
+				if currentLesson.ID != lesson.ID {
+					continue
+				}
+				for _, current := range currentLesson.Units {
+					if current.ID == unit.ID && current.ContentType == 3 && current.ContentID == unit.ContentID && current.ViewStatus != nil {
+						return *current.ViewStatus, nil
+					}
+				}
+			}
+		}
+		return 0, &RequestError{Operation: "document completion state", Kind: ErrUnexpectedResponse}
+	}
+	status, err := readStatus()
+	if err != nil {
+		return err
+	}
+	if status == 5 {
+		return nil
+	}
+	err = c.run(ctx, func(ctx context.Context) error {
+		if _, err := c.currentUser(ctx); err != nil {
+			return err
+		}
+		payload, err := json.Marshal(struct {
+			DTO any `json:"dto"`
+		}{map[string]any{
+			"courseId": json.Number(course.ID), "termId": json.Number(course.TermID),
+			"lessonId": json.Number(lesson.ID), "unitId": json.Number(unit.ID),
+			"contentType": 3, "finished": true, "index": 0, "pageNum": 1,
+			"lastLearnTime": time.Now().UnixMilli(), "learnedVideoTimeCount": 0,
+		}})
+		if err != nil {
+			return invalid
+		}
+		return c.reportContentProgress(ctx, "document completion", payload)
+	})
+	if err != nil {
+		return err
+	}
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			timer := time.NewTimer(2 * time.Second)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+		status, err = readStatus()
+		if err != nil {
+			return err
+		}
+		if status == 5 {
+			return nil
+		}
+	}
+	return &RequestError{Operation: "document completion not confirmed", Kind: ErrRemoteRejected}
+}

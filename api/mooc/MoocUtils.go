@@ -54,7 +54,12 @@ func parseRSAPublicKey(pemStr string) (*rsa.PublicKey, error) {
 }
 
 func BuildPowGetPParams(pd, pkid, un, pvSid string, channel int, topURL, rtid string) string {
-	return marshalParams(map[string]any{"pd": pd, "pkid": pkid, "un": un, "pvSid": pvSid, "channel": strconv.Itoa(channel), "topURL": topURL, "rtid": rtid})
+	params := map[string]any{"pd": pd, "pkid": pkid, "un": un, "channel": strconv.Itoa(channel), "topURL": topURL, "rtid": rtid}
+	// The first challenge request omits pvSid; later calls echo the server-issued sid.
+	if pvSid != "" {
+		params["pvSid"] = pvSid
+	}
+	return marshalParams(params)
 }
 
 func BuildZCInitParams(pd, pkid, pkht string, channel int, topURL, rtid string) string {

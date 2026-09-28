@@ -117,8 +117,35 @@ func (c *Client) clearSession() {
 }
 func validAESKey(k []byte) bool { return len(k) == 16 || len(k) == 24 || len(k) == 32 }
 
+// LoginCookies installs browser cookies, derives the study keys over HTTP, then verifies identity.
+func (c *Client) LoginCookies(ctx context.Context, cookies []*http.Cookie) (*User, error) {
+	return c.login(ctx, func(ctx context.Context) error {
+		if err := c.installCookies(cookies); err != nil {
+			return err
+		}
+		c.mapID = ""
+		return c.fetchSessionKeys(ctx)
+	})
+}
+
 // LoginBrowserSession succeeds only after the server identifies the current user.
 func (c *Client) LoginBrowserSession(ctx context.Context, session BrowserSession) (*User, error) {
+	return c.login(ctx, func(ctx context.Context) error {
+		if len(session.Cookies) == 0 || !validAESKey(session.AIKey) || !validAESKey(session.CourseKey) || len(session.IV) != aes.BlockSize {
+			return &RequestError{Operation: "browser session", Kind: ErrAuthenticationFailed}
+		}
+		if err := c.installCookies(session.Cookies); err != nil {
+			return err
+		}
+		c.aiKey = append([]byte(nil), session.AIKey...)
+		c.courseKey = append([]byte(nil), session.CourseKey...)
+		c.iv = append([]byte(nil), session.IV...)
+		c.mapID = session.MapID
+		return nil
+	})
+}
+
+func (c *Client) login(ctx context.Context, prepare func(context.Context) error) (*User, error) {
 	var user *User
 	err := c.run(ctx, func(ctx context.Context) error {
 		c.clearSession()
@@ -128,46 +155,50 @@ func (c *Client) LoginBrowserSession(ctx context.Context, session BrowserSession
 				c.clearSession()
 			}
 		}()
-		invalid := &RequestError{Operation: "browser session", Kind: ErrAuthenticationFailed}
-		if len(session.Cookies) == 0 || !validAESKey(session.AIKey) || !validAESKey(session.CourseKey) || len(session.IV) != aes.BlockSize {
-			return invalid
+		if err := prepare(ctx); err != nil {
+			return err
 		}
-		for _, source := range session.Cookies {
-			if source == nil {
-				return invalid
-			}
-			cookie := *source
-			domain := strings.ToLower(cookie.Domain)
-			host := strings.TrimPrefix(domain, ".")
-			if host != "zhihuishu.com" && !strings.HasSuffix(host, ".zhihuishu.com") {
-				return invalid
-			}
-			if cookie.Path == "" || cookie.Path[0] != '/' {
-				return invalid
-			}
-			if len(cookie.Value) >= 2 && cookie.Value[0] == '"' && cookie.Value[len(cookie.Value)-1] == '"' {
-				cookie.Value = cookie.Value[1 : len(cookie.Value)-1]
-				cookie.Quoted = true
-			}
-			cookie.Domain = domain
-			if cookie.Valid() != nil {
-				return invalid
-			}
-			if !strings.HasPrefix(domain, ".") {
-				cookie.Domain = ""
-			}
-			c.httpClient.Jar.SetCookies(&url.URL{Scheme: "https", Host: host, Path: cookie.Path}, []*http.Cookie{&cookie})
-		}
-		c.aiKey = append([]byte(nil), session.AIKey...)
-		c.courseKey = append([]byte(nil), session.CourseKey...)
-		c.iv = append([]byte(nil), session.IV...)
-		c.mapID = session.MapID
 		var err error
 		user, err = c.currentUser(ctx)
 		verified = err == nil
 		return err
 	})
 	return user, err
+}
+
+// installCookies keeps only site-scoped cookies and mirrors the browser's domain rules.
+func (c *Client) installCookies(cookies []*http.Cookie) error {
+	invalid := &RequestError{Operation: "browser session", Kind: ErrAuthenticationFailed}
+	if len(cookies) == 0 {
+		return invalid
+	}
+	for _, source := range cookies {
+		if source == nil {
+			return invalid
+		}
+		cookie := *source
+		domain := strings.ToLower(cookie.Domain)
+		host := strings.TrimPrefix(domain, ".")
+		if host != "zhihuishu.com" && !strings.HasSuffix(host, ".zhihuishu.com") {
+			return invalid
+		}
+		if cookie.Path == "" || cookie.Path[0] != '/' {
+			return invalid
+		}
+		if len(cookie.Value) >= 2 && cookie.Value[0] == '"' && cookie.Value[len(cookie.Value)-1] == '"' {
+			cookie.Value = cookie.Value[1 : len(cookie.Value)-1]
+			cookie.Quoted = true
+		}
+		cookie.Domain = domain
+		if cookie.Valid() != nil {
+			return invalid
+		}
+		if !strings.HasPrefix(domain, ".") {
+			cookie.Domain = ""
+		}
+		c.httpClient.Jar.SetCookies(&url.URL{Scheme: "https", Host: host, Path: cookie.Path}, []*http.Cookie{&cookie})
+	}
+	return nil
 }
 func (c *Client) authenticationError(operation string) error {
 	c.user = nil

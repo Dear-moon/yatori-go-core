@@ -144,9 +144,6 @@ func (c *MOOCClient) powGetP(ctx context.Context, proofSessionID string) error {
 	if !c.initialized || c.tk == "" {
 		return &RequestError{Operation: "pow", Kind: ErrSessionExpired}
 	}
-	if strings.TrimSpace(proofSessionID) == "" {
-		return &RequestError{Operation: "pow session identifier", Kind: ErrNeedsUserAction}
-	}
 	rtid, err := BuildRtId()
 	if err != nil {
 		return err
@@ -186,6 +183,14 @@ func (c *MOOCClient) submitLogin(ctx context.Context, password string) error {
 	if password == "" {
 		return &RequestError{Operation: "login", Kind: ErrAuthenticationFailed}
 	}
+	if err := c.submitPassword(ctx, password); err != nil {
+		return err
+	}
+	// This entry point cannot confirm the resulting identity on its own.
+	return &RequestError{Operation: "login identity", Kind: ErrAuthenticationUnverified}
+}
+
+func (c *MOOCClient) submitPassword(ctx context.Context, password string) error {
 	runTimes, spendTime, iterations, x, sign, err := VdfAsyncContext(ctx, c.proof.data())
 	if err != nil {
 		return err
@@ -207,11 +212,48 @@ func (c *MOOCClient) submitLogin(ctx context.Context, password string) error {
 		return err
 	}
 	var response map[string]json.RawMessage
-	if err := decodeResponse("login", body, &response); err != nil {
-		return err
-	}
-	// No verified final response schema or identity endpoint exists in the source evidence.
-	return &RequestError{Operation: "login identity", Kind: ErrAuthenticationUnverified}
+	return decodeResponse("login", body, &response)
+}
+
+// LoginWithPassword runs the password flow and confirms the session through the profile page.
+func (c *MOOCClient) LoginWithPassword(ctx context.Context, password string) (*MOOCUser, error) {
+	var user *MOOCUser
+	err := c.run(ctx, func(ctx context.Context) error {
+		if strings.TrimSpace(c.account) == "" || strings.TrimSpace(password) == "" {
+			return &RequestError{Operation: "password login", Kind: ErrAuthenticationFailed}
+		}
+		c.smsPending = false
+		if err := c.initCookies(ctx); err != nil {
+			return err
+		}
+		if err := c.gt(ctx); err != nil {
+			return err
+		}
+		// The first challenge request carries no pvSid; the response issues it.
+		if err := c.powGetP(ctx, ""); err != nil {
+			return err
+		}
+		if err := c.submitPassword(ctx, password); err != nil {
+			return err
+		}
+		// The passport redirect issues the site session cookies, so the homepage must load again.
+		if _, err := c.request(ctx, "session exchange", http.MethodGet, siteURL, nil, false); err != nil {
+			return err
+		}
+		var err error
+		user, err = c.currentUser(ctx)
+		if err != nil {
+			if errors.Is(err, ErrAuthenticationFailed) {
+				return &RequestError{Operation: "password login", Kind: ErrAuthenticationUnverified, cause: err}
+			}
+			return err
+		}
+		if user == nil || user.ID == "" {
+			return &RequestError{Operation: "password login", Kind: ErrAuthenticationUnverified}
+		}
+		return nil
+	})
+	return user, err
 }
 
 func (c *MOOCClient) InitCookies(ctx context.Context) error {

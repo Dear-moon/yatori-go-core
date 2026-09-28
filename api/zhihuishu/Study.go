@@ -35,13 +35,31 @@ func (c *Client) StudyVideo(ctx context.Context, course AICourse, knowledgeID st
 				Start    string `json:"videoStartTime"`
 				End      string `json:"videoEndTime"`
 			} `json:"resourcesQuoteDetail"`
-			Video any `json:"resourcesVideoDetail"`
+			Video *struct {
+				Segments []struct {
+					Start string `json:"videoSegStartTime"`
+					End   string `json:"videoSegEndTime"`
+				} `json:"videoSegList"`
+			} `json:"resourcesVideoDetail"`
 		}
 		if err := c.aiRequest(ctx, "video detail", "/stu/resources/get-node-resources-detail", params, &detail); err != nil {
 			return err
 		}
-		if detail.Video != nil || (detail.Quote != nil && detail.Quote.FileType != 0 && detail.Quote.FileType != 1) {
+		if detail.Quote != nil && detail.Quote.FileType != 0 && detail.Quote.FileType != 1 {
 			return ErrUnsupportedResource
+		}
+		// videoSegList bounds the playable range; multi-segment resources stay unsupported.
+		clipStart, clipEnd := 0, 0
+		if detail.Video != nil {
+			if len(detail.Video.Segments) != 1 {
+				return ErrUnsupportedResource
+			}
+			start, startErr := strconv.ParseInt(detail.Video.Segments[0].Start, 10, 64)
+			end, endErr := strconv.ParseInt(detail.Video.Segments[0].End, 10, 64)
+			if startErr != nil || endErr != nil || start < 0 || end <= start {
+				return ErrUnsupportedResource
+			}
+			clipStart, clipEnd = int(start/1000), int((end+999)/1000)
 		}
 		params, _ = courseParams(course)
 		params["videoIdList"] = []string{resource.FileID}
@@ -64,6 +82,12 @@ func (c *Client) StudyVideo(ctx context.Context, course AICourse, knowledgeID st
 		if total < 0 || total > 86400 {
 			return ErrUnexpectedResponse
 		}
+		if clipEnd > 0 {
+			if clipEnd > total {
+				return ErrUnexpectedResponse
+			}
+			total = clipEnd
+		}
 		params, _ = resourceParams(course, knowledgeID)
 		params["shareCourseId"] = ""
 		var positions map[string]int
@@ -73,7 +97,6 @@ func (c *Client) StudyVideo(ctx context.Context, course AICourse, knowledgeID st
 		if positions[resource.ID] < 0 || positions[resource.ID] > total {
 			return ErrUnexpectedResponse
 		}
-		clipStart := 0
 		if detail.Quote != nil && detail.Quote.End != "" && detail.Quote.End != "0" {
 			start, startErr := strconv.ParseInt(detail.Quote.Start, 10, 64)
 			end, endErr := strconv.ParseInt(detail.Quote.End, 10, 64)

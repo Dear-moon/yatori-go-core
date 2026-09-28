@@ -417,3 +417,39 @@ func TestUnavailableVideoDoesNotWriteProgress(t *testing.T) {
 		t.Fatalf("unexpected result: %v", err)
 	}
 }
+func TestFullRangeVideoSegmentCompletes(t *testing.T) {
+	c, _ := NewClient(ClientOptions{})
+	defer c.Close()
+	callbacks := 0
+	c.httpClient.Transport = offlineTransport(func(r *http.Request) (*http.Response, error) {
+		switch {
+		case strings.Contains(r.URL.Path, "getLoginUserInfo"):
+			return jsonResponse(r, profileFixture), nil
+		case strings.Contains(r.URL.Path, "is-end-study"):
+			return jsonResponse(r, `{"code":200,"data":false}`), nil
+		case strings.Contains(r.URL.Path, "get-node-resources-detail"):
+			return jsonResponse(r, `{"code":200,"data":{"resourcesQuoteDetail":null,"resourcesVideoDetail":{"videoSegList":[{"videoSegStartTime":"0","videoSegEndTime":"1000"}]}}}`), nil
+		case strings.Contains(r.URL.Path, "get-video-time"):
+			return jsonResponse(r, `{"code":200,"data":[{"videoId":123,"time":1}]}`), nil
+		case strings.Contains(r.URL.Path, "get-knowledge-video-time"):
+			return jsonResponse(r, `{"code":200,"data":{}}`), nil
+		case strings.Contains(r.URL.Path, "initVideoNew"):
+			return jsonResponse(r, `{"successful":true,"result":{"lines":[{"lineUrl":"https://example.invalid/video"}]}}`), nil
+		default:
+			return jsonResponse(r, `{"code":200,"data":null}`), nil
+		}
+	})
+	ctx := context.Background()
+	if _, err := c.LoginBrowserSession(ctx, testSession()); err != nil {
+		t.Fatal(err)
+	}
+	err := c.StudyVideo(ctx, AICourse{ID: "course", ClassID: "class"}, "point", Resource{ID: "resource", FileID: "123", DataType: 22}, func(position, total int) {
+		callbacks++
+		if total != 1 {
+			t.Fatalf("unexpected total: %d", total)
+		}
+	})
+	if err != nil || callbacks != 2 {
+		t.Fatalf("unexpected result: %v callbacks=%d", err, callbacks)
+	}
+}

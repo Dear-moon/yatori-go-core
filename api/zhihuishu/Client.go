@@ -64,6 +64,7 @@ type Client struct {
 	gate                 chan struct{}
 	timeout              time.Duration
 	aiKey, courseKey, iv []byte
+	examKey              []byte
 	mapID                string
 	verifiedOnce         bool
 	user                 *User
@@ -110,7 +111,7 @@ func (c *Client) run(ctx context.Context, f func(context.Context) error) error {
 func (c *Client) clearSession() {
 	jar, _ := cookiejar.New(&cookiejar.Options{PublicSuffixList: publicsuffix.List})
 	c.httpClient.Jar = jar
-	c.aiKey, c.courseKey, c.iv = nil, nil, nil
+	c.aiKey, c.courseKey, c.iv, c.examKey = nil, nil, nil, nil
 	c.mapID = ""
 	c.user = nil
 	c.verifiedOnce = false
